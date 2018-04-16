@@ -5,6 +5,7 @@ LDFLAGS += -nostdlib
 
 EXTENSIONS := .o .partial .so .elf .pie
 TARGETS += $(addprefix xtensa_32,$(EXTENSIONS))
+TARGETS += $(addprefix xtensa_diff,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_pcrel,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_plt,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_relative,$(EXTENSIONS))
