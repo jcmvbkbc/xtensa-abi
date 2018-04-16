@@ -9,6 +9,7 @@ TARGETS += $(addprefix xtensa_pcrel,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_plt,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_relative,$(EXTENSIONS))
 TARGETS += $(addprefix xtensa_rtld,$(EXTENSIONS))
+TARGETS += $(addprefix xtensa_tls,$(EXTENSIONS))
 
 all:  $(TARGETS)
 
