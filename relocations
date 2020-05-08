@@ -316,4 +316,4 @@ Reloc type:	Partial in place, not marked as such in BFD.
 		containing section.
 ELF types:	REL
 Sections:	.rela.<referenced section name>
-Calculation:	v(relaxed) = (S + A - v(zero extended))(relaxed) - (S + A)(relaxed)
+Calculation:	v(relaxed) = (S + A + v(one extended))(relaxed) - (S + A)(relaxed)
