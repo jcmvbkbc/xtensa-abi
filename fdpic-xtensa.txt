@@ -1,0 +1,984 @@
+                         The Xtensa FDPIC ABI
+
+                            April 8, 2024
+                              Version 1
+
+Based on SH FDPIC ABI Version 1.0 by Joseph Myers.
+Based on FR-V FDPIC ABI Version 1.0a by Kevin Buettner, Alexandre
+Oliva and Richard Henderson.
+
+Introduction
+------------
+
+This document describes extensions to the existing Xtensa ELF ABI (as
+used on GNU/Linux) required to support the implementation of shared
+libraries on a system whose OS (and hardware) require that processes
+share a common address space.  This document will also attempt to
+explore the motivations behind and the implications of these extensions.
+
+One of the primary goals in using shared libraries is to reduce the
+memory requirements of the overall system.  Thus, if two processes use
+the same library, the hope is that at least some of the memory pages
+will be shared between the two processes resulting in an overall
+savings.  To realize these savings, tools used to build a program and
+library must identify which sections may be shared and which must not
+be shared.  The shared sections, when grouped together, are commonly
+referred to as the "text segment" whereas the non-shared (grouped)
+sections are commonly referred to as the "data segment".  The text
+segment is read-only and is usually comprised of executable code and
+read-only data.  The data segment must be writable and it is this fact
+which makes it non-sharable.
+
+Systems which utilize disjoint address spaces for its processes are
+free to group the text and data segments in such a way that they
+may always be loaded with fixed relative positions of the text
+and data segments.  I.e, for a given load object, the offset from
+the start of the text segment to the start of the data segment is
+constant.  This property greatly simplifies the design of the
+shared library machinery.
+
+The design of the shared library mechanism described in this document
+does not (and cannot) have this property.  Due to the fact that all
+processes share a common address space, the text and data segments
+will be placed at arbitrary locations relative to each other and will
+therefore need a mechanism whereby executable code will always be able
+to find its corresponding data.  One of the CPU's registers is
+typically dedicated to hold the base address of the data segment.
+This register will be called the "FDPIC register" in this document.
+Such a register is sometimes used in systems with disjoint address
+spaces too, but this is for efficiency rather than necessity.
+
+The fact that the locations of the text and data segments are at
+non-constant offsets with respect to each other also complicates
+function pointer representation.  As noted above, executable code
+must be able to find its corresponding data segment.  When making an
+indirect function call, it is therefore important that both the
+address of the function and the base address of the data segment are
+available.  This means that a function pointer needs to represented as
+the address of a "function descriptor" which contains the address of
+the actual code to execute as well as the corresponding data (FDPIC
+register) address.
+
+
+FDPIC Register
+--------------
+
+The FDPIC register is used as a base register for accessing the global
+offset table (GOT) and function descriptors.  Since both code and data
+are relocatable, executable code may not contain any instruction
+sequences which directly encode a pointer's value.  Instead, pointers
+to global data are indirectly referenced via the global offset table.
+At load time, pointers contained in the global offset table are
+relocated by the dynamic linker to point at the correct locations.
+
+This FDPIC ABI is defined as extension of the base call0 Xtensa ABI.
+Register a11 is used as the FDPIC register.  Version of the FDPIC ABI
+based on windowed Xtensa ABI is not defined in this document revision.
+
+Upon entry to a function, the caller saved register a11 is the FDPIC
+register.  As described above, it contains the GOT address for that
+function.  a11 obtains its value in one of the following ways:
+
+    1) By being inherited from the calling function in the case
+       of a direct call to a function within the same load module.
+
+    2) By being set from a function descriptor as part of a direct
+       or an indirect call.
+
+The specifics associated with each of these cases are covered in
+greater detail in "Function Calls", below.
+
+A non-leaf function should save a11 either on the stack or in one of
+the callee-saved registers if it needs to use it later.  After that
+there's no requirement to preserve the original a11 value, that
+register does not have any special meaning inside the function.
+
+Note that once a function has moved a11 to one of its callee saved
+registers, the function is then free to use that register as the FDPIC
+register for accessing data.  This is why the sections describing
+relocations are careful to specify FDPIC-relative references instead
+of a11-relative references.  In the code examples the register holding
+GOT pointer is referred to as localGOTreg.
+
+It's envisioned (though not mandated) that the GOT entries are located
+at positive FDPIC-based offsets.
+
+
+Function Descriptors
+--------------------
+
+A number of programs assume that pointers to functions are as wide as
+pointers to data, even though programming languages don't require
+this.  However, two words are needed to represent a function pointer
+meaningfully:  not only is the function's entry point required, but
+also some context information that enables the function to find the
+corresponding data segment in the current process.  Such context
+information is given in the form of a pointer to the GOT in FDPIC
+(which is a11 upon entry to a function).
+
+In order to keep pointers to functions as 32-bit values, while adding
+context information to them, we introduce function descriptors, such
+that, when the address of a function is taken, the address of its
+descriptor is obtained.  As shown below, the descriptor contains
+pointers to both the function's entry point and its GOT.  A load
+module will also likely contain a number of private function
+descriptors.
+
+A function descriptor consists of two 4-byte words:
+
+    1) The "entry point" at offset 0 contains the text address of the
+       function.  This is the address at which to start executing
+       the function.
+
+    2) The "GOT address" at offset 4 contains the value to which the FDPIC
+       register must be set when executing the function.
+
+Each private function descriptor in a dynamic module needs to be
+initialized using a 64-bit relocation which fills in both the function
+entry point and GOT address.  The R_XTENSA_FUNCDESC_VALUE relocation is
+used for this purpose.
+
+Statically linked module may not have dynamic relocations.  In that case
+private function descriptor may have two separate entries in the .rofixup
+section, one for the entry point and the other for the GOT address.
+
+
+Function Addresses
+------------------
+
+When a function address is required, the address of an "official" (or
+canonical) function descriptor is used.  Descriptors corresponding to
+static, non-overridable functions are allocated by the link editor
+and are initialized at load time via the R_XTENSA_FUNCDESC_VALUE
+relocation.  The dynamic linker is responsible for allocating and
+initializing all other "official" function descriptors.
+
+As described above, a function's address is actually the address of a
+function descriptor, not that of the function's entry point.  As is
+the case with other kinds of pointers, executable code obtains the
+values of pointer constants via the global offset table.  The
+R_XTENSA_FUNCDESC relocation (see below) is used in global offset table
+entries and initialized data to obtain the addresses of function
+descriptors used for representing function addresses.
+
+Note: This document borrows many of the concepts and terminology
+related to function addresses and their descriptors from the IA-64
+System V ABI [1, 2].
+
+
+Procedure Linkage Table (PLT)
+-----------------------------
+
+This document revision does not specify PLT.  The specification may
+be added in the future revisions of this document.
+
+
+Dynamic Linker Reserve Area
+---------------------------
+
+The linker reserves three words starting at the location pointed to by
+the FDPIC register for use by the dynamic linker.  The first two words
+comprise a function descriptor for invoking the resolver used in lazy
+dynamic linking.  The third (at FDPIC+8) is used by the dynamic linker
+and the debugger to obtain access to information regarding the loaded
+module and the amount that each segment has been relocated by.
+
+
+Lazy Procedure Linkage
+----------------------
+
+This document revision does not specify lazy procedure linkage.
+
+
+Function Calls
+--------------
+
+Direct function calls are performed as follows:
+
+                "set up arguments as per the base ABI"
+                "load function entry point address into a register"
+                "load local FDPIC pointer copy into a11"
+                "call loaded address"
+                "restore any needed "caller saved" registers"
+
+The "call loaded address" pseudo-instruction will transfer control
+directly to the function's entry point.
+
+Indirect calls are performed by loading the entry point from the function
+descriptor into a free register e.g. into a0 and GOT address into a11,
+respectively.  The same atomicity issues apply as when these are loaded
+from a PLT entry, so again the entry point address must be loaded first.
+Control is transferred via a callx0 instruction to the function's entry
+point.  The call site for an indirect function call might look like this:
+
+                "set up arguments as per the base ABI"
+                "load function descriptor address into a register"
+                "load entry point and GOT address from function descriptor
+                 into a0 and a11"
+                "call loaded entry point"
+                "restore any needed "caller saved" registers"
+
+
+Global Data and the Global Offset Table (GOT)
+---------------------------------------------
+
+As noted earlier, position independent code must not contain any
+instruction sequences which directly encode a reference to global
+data.  If they did so, load time relocations would be necessary to
+adjust these addresses.  Also, any reference to a address in a
+non-shared segment would force the executable segment in question to
+be non-sharable.
+
+The global offset table (GOT) contains words which hold the
+addresses of global data.  In order to access these global data,
+position independent code must first use an FDPIC-relative load
+instruction to fetch the data address from the GOT.
+The data structure is then accessed as necessary using the address
+obtained from the GOT.  It is envisioned that the various GOT
+related structures might look something like this:
+
+                +-----------------------+ <---\ <--------------\
+   FDPIC -----> |                       |     |                |
+                +- Resolver Descriptor -+   Dynamic Linker     |
+                |                       |   Reserve Area       |
+                +-----------------------+     |                |
+                |   link_map pointer    |     |                |
+                +-----------------------+ <---/             Global
+                | Global Data Addr #1   |                   Offset
+                +-----------------------+                   Table
+                | Global Data Addr #2   |                   (GOT)
+                +-----------------------+                      |
+                | Global Data Addr #3   |                      |
+                +-----------------------+                      |
+                |          .            |                      |
+                           .                                   |
+                |          .            |                      |
+                +-----------------------+                      |
+                |                       |                      |
+                +- Func Descriptor #1  -+                      |
+                |                       |                      |
+                +-----------------------+                      |
+                |                       |                      |
+                +- Func Descriptor #2  -+                      |
+                |                       |                      |
+                +-----------------------+                      |
+                |          .            |                      |
+                           .                                   |
+                |          .            |                      |
+                +-----------------------+ <--------------------/
+
+The link-editor is responsible for determining the precise layout
+of the GOT.  The only hard requirements are the following:
+
+    (a) FDPIC must point at the first word of the dynamic linker
+        reserve area.
+    (b) The global offset table must reside in a non-shared segment.
+
+In the picture above, function descriptors are placed after the data
+addresses, but it's not a requirement, they can be freely intermixed.
+Also, note that there is no requirement that the function descriptors
+or data address entries have any particular grouping.
+
+GOT initialization is performed at load time by the dynamic linker.
+In order to accomplish these initializations, the dynamic linker uses
+relocations that have been placed in the object file by the link
+editor.  These relocations (as already defined for non-FDPIC) may
+cause addresses of other global data in other load modules to be
+resolved or the relocation may refer to data within the same load
+module.
+
+Each load module has a symbol _GLOBAL_OFFSET_TABLE_ which resolves to
+the GOT address for that load module.  The DT_PLTGOT dynamic section
+entry in each load module contains the GOT address also.  The GOT
+address points to the dynamic linker reserve area.
+
+The simplest way to load the address of a data object, on all Xtensa
+variants, is:
+
+        movi    tmp1, foo@GOT
+        add     tmp2, tmp1, localGOTreg
+        l32i    res, tmp2, 0
+
+The first movi instruction in the sequence above and similar instructions
+in the examples below will be relaxed by the assembler into a sequence
+suitable for the target Xtensa CPU.  For configurations that use
+the l32r instruction the result of relaxation will be the following:
+
+        .literal .L1, foo@GOT
+        l32r    tmp1, .L1
+
+This document revision does not specify relaxation for configurations
+that use the const16 instruction, but it is envisioned that a combination
+of R_XTENSA_GOT and R_XTENSA_SLOT_OP / R_XTENSA_SLOT_ALT relocation
+records will be used.
+
+If data symbol bar is known to be local to the translation unit, or to
+have internal, hidden or protected (but not global) visibility,
+different sequences can be used that assume the symbol to be located
+at a fixed offset within the text or data segments.  These sequences
+avoid the need for a GOT entry for bar.  If the symbol is known to be
+in the .data section, the following sequence computes the address of
+bar:
+
+        movi    tmp1, bar@GOTOFF
+        add     res, tmp1, localGOTreg
+
+If the symbol is known to be in the .rodata section (that is mapped to
+the text segment), section-relative relocations have to be used instead.
+The @SECREL and @GOTSECBASE assembler operators are defined for this
+purpose.  First produces the offset of the symbol it is applied to from
+the beginning of its containing section.  Second produces the offset of
+the GOT entry holding the address of the section containing the symbol.
+For example:
+
+        movi    tmp1, bar@SECREL
+        l32i    tmp2, localGOTreg, bar@GOTSECBASE
+        add     res, tmp1, tmp2
+
+Taking the address of a function descriptor can be accomplished with
+the following sequence:
+
+        movi    tmp1, foo@GOTFUNCDESC
+        add     tmp2, tmp1, localGOTreg
+        l32i    res, tmp2, 0
+
+If the function is local to a translation unit, or is known to have
+internal or hidden (but not protected or global) visibility, the
+canonical function descriptor of the function will be in the module,
+so it is possible to avoid the need for a GOT entry containing the
+address of the function descriptor, by using code sequence like:
+
+        movi    tmp1, foo@GOTOFFFUNCDESC
+        add     res, tmp1, localGOTreg
+
+Global-scope variable initialized with a pointer to a function causes
+code like this to be generated:
+
+bar:    .long   foo@FUNCDESC
+
+Variables initialized with pointers (to data or code) must not be
+assigned to read-only segments; the dynamic linker will need to set up
+the pointers at module load time.
+
+
+Thread-Local Data
+-----------------
+
+Basic concepts and terminology are described in [6].  This specification
+defines instruction sequences and relocations for the General Dynamic,
+Local Dynamic, Initial Exec and Local Exec TLS access modes and possible
+link-time relaxations.
+
+Instead of introducing opcode modifiers or assembler suffixes to mark
+individual instructions for relaxation purposes this specification uses
+explicit assembler directive .reloc.
+
+In the examples GOTreg denotes the FDPIC register, arg0 is the first
+outgoing function argument register, rv0 is the first function result
+value register.
+
+General Dynamic
+---------------
+
+Getting address of a thread-local variable x:
+
+        movi    tmp1, x@GOTTLSDESC
+        .reloc  ., R_XTENSA_TLS_ARG, x
+        add     arg0, tmp1, localGOTreg
+        .reloc  ., R_XTENSA_TLS_FUNCDESC, x
+        l32i    tmp2, arg0, 0
+        .reloc  ., R_XTENSA_TLS_GOT, x
+        l32i    GOTreg, tmp2, 4
+        .reloc  ., R_XTENSA_TLS_FUNC, x
+        _l32i   tmp3, tmp2, 0
+        .reloc  ., R_XTENSA_TLS_CALL, x
+        callx0  tmp3
+
+@GOTTLSDESC assembler operator generates R_XTENSA_GOTTLSDESC relocation
+that, if left unrelaxed, results in allocation of TLS descriptor in the
+GOT with R_XTENSA_TLSDESC dynamic relocation for it and substitution of
+offset of that descriptor from the GOT start.
+
+Local Dynamic
+-------------
+
+Getting address of a thread-local variable x is done by using GD
+sequence for the symbol _TLS_MODULE_BASE_ to get location of this
+module's TLS block and adding offset of the symbol x inside the module:
+
+        movi    tmp1, _TLS_MODULE_BASE_@GOTTLSDESC
+        .reloc  ., R_XTENSA_TLS_ARG, _TLS_MODULE_BASE_
+        add     arg0, tmp1, localGOTreg
+        .reloc  ., R_XTENSA_TLS_FUNCDESC, _TLS_MODULE_BASE_
+        l32i    tmp2, arg0, 0
+        .reloc  ., R_XTENSA_TLS_GOT, _TLS_MODULE_BASE_
+        l32i    GOTreg, tmp2, 4
+        .reloc  ., R_XTENSA_TLS_FUNC, _TLS_MODULE_BASE_
+        _l32i   tmp3, tmp2, 0
+        .reloc  ., R_XTENSA_TLS_CALL, _TLS_MODULE_BASE_
+        callx0  tmp3
+        ...
+        movi    tmp3, x@DTPOFF
+        add     res, tmp3, rv0
+
+@DTPOFF assembler operator generates R_XTENSA_TLS_DTPOFF relocation that
+is resolved by the linker.
+
+Initial Exec
+------------
+
+        movi    tmp1, x@GOTTPOFF
+        .reloc  ., R_XTENSA_TLS_TPOFF_PTR, x
+        add     tmp2, tmp1, localGOTreg
+        .reloc  ., R_XTENSA_TLS_TPOFF_LOAD, x
+        l32i    tmp3, tmp2, 0
+        rur     tmp4, THREADPTR
+        add     res, tmp3, tmp4
+
+@GOTTPOFF assembler operator generates R_XTENSA_TLS_GOTTPOFF relocation
+that, if left unrelaxed, results in allocation of GOT entry with
+R_XTENSA_TLS_TPOFF dynamic relocation for it and substitution of offset
+of that entry from the GOT start.
+
+Local Exec
+----------
+
+        movi    tmp1, x@TPOFF
+        rur     tmp2, THREADPTR
+        add     res, tmp1, tmp2
+
+@TPOFF assembler operator generates R_XTENSA_TLS_TPOFF relocation that
+is resolved by the linker.
+
+GD -> IE Link-Time Relaxation
+-----------------------------
+
+        movi    tmp1, x@GOTTLSDESC                                      movi    tmp1, x@GOTTPOFF
+        add     arg0, tmp1, localGOTreg         # TLS_ARG               add     arg0, tmp1, localGOTreg
+        l32i    tmp2, arg0, 0                   # TLS_FUNCDESC          l32i    arg0, arg0, 0
+        l32i    GOTreg, tmp2, 4                 # TLS_GOT               nop
+        _l32i   tmp3, tmp2, 0                   # TLS_FUNC              rur     tmp3, THREADPTR
+        callx0  tmp3                            # TLS_CALL              add     arg0, arg0, tmp3
+
+GD -> LE Link-Time Relaxation
+-----------------------------
+
+        movi    tmp1, x@GOTTLSDESC                                      movi    tmp1, x@TPOFF
+        add     arg0, tmp1, localGOTreg         # TLS_ARG               mov     arg0, tmp1
+        l32i    tmp2, arg0, 0                   # TLS_FUNCDESC          nop
+        l32i    GOTreg, tmp2, 4                 # TLS_GOT               nop
+        _l32i   tmp3, tmp2, 0                   # TLS_FUNC              rur     tmp3, THREADPTR
+        callx0  tmp3                            # TLS_CALL              add     arg0, arg0, tmp3
+
+IE -> LE Link-Time Relaxation
+-----------------------------
+
+        movi    tmp1, x@GOTTPOFF                                        movi    tmp1, x@TPOFF
+        add     tmp2, tmp1, localGOTreg         # TLS_TPOFF_PTR         mov     tmp2, tmp1
+        l32i    tmp3, tmp2, 0                   # TLS_TPOFF_LOAD        mov     tmp3, tmp2
+        rur     tmp4, THREADPTR                                         rur     tmp4, THREADPTR
+        add     res, tmp3, tmp4                                         add     res, tmp3, tmp4
+
+Preexisting Relocation Types
+----------------------------
+
+The existing relocations implemented by the GNU linker may be used
+with FDPIC code with their existing semantics, although some may not
+be useful in this context.  When an existing relocation is applied to
+a function symbol, it is taken to refer to the function entry point
+(possibly a PLT entry), not to a function descriptor.
+
+Some of the existing Xtensa relocation types have inconsistent semantic.
+This specification provides new relocation types as a consistent
+replacement:
+
+ - R_XTENSA_RELATIVE doesn't use its addend consistently, when used as
+   a dynamic relocation its addend symbol fields are expected to be 0,
+   as if it's a REL-type relocation, not RELA.
+   R_XTENSA_SYM32 is introduced as a replacement.  Relative relocation
+   for an entry pointing to a specific offset inside a specific section
+   can be expressed as R_XTENSA_SYM32 with the symbol for the target
+   section and the addend for the offset inside that section.
+
+
+New Relocations
+---------------
+
+The following are new relocation types for supporting position independent
+code with function descriptors.
+
+    Name                    Value  Meaning
+    ----                    -----  -------
+    R_XTENSA_SYM32           63    Used for section-relative pointers
+                                    in .data, GOT and any other writable
+                                    section.
+    R_XTENSA_GOT             64    Used for the FDPIC-relative offset
+                                    to a GOT entry for a symbol.
+    R_XTENSA_GOTOFF          65    Used for the FDPIC-relative offset
+                                    to a data object.
+    R_XTENSA_GOTFUNCDESC     66    Used for the FDPIC-relative offset
+                                    to a GOT entry containing a
+                                    pointer to a function descriptor
+                                    for a symbol.
+    R_XTENSA_GOTOFFFUNCDESC  67    Used for the FDPIC-relative offset
+                                    to the function descriptor itself.
+    R_XTENSA_FUNCDESC        68    Used for a pointer to an "official"
+                                    function descriptor, in both GOT
+                                    entries and user-initialized data.
+    R_XTENSA_FUNCDESC_VALUE  69    Used to fill in function entry point
+                                    and GOT address in private function
+                                    descriptors.
+
+    R_XTENSA_TLS_GOTTPOFF    70    Used for the FDPIC-relative offset
+                                    to a GOT entry containing TLS symbol
+                                    offset from the TLS pointer.
+    R_XTENSA_GOTTLSDESC      71    Used for the FDPIC-relative offset
+                                    to a TLS descriptor in GOT.
+    R_XTENSA_TLSDESC         72    Uset to fill in resolver function
+                                    pointer and its argument in a TLS
+                                    descriptor.
+
+    R_XTENSA_TLS_FUNCDESC    73    This group is used to mark
+    R_XTENSA_TLS_GOT         74     instructions within TLS access
+    R_XTENSA_TLS_TPOFF_PTR   75     sequences that must be transformed
+    R_XTENSA_TLS_TPOFF_LOAD  76     during link-time relaxation.
+
+    R_XTENSA_SECREL          77    Used to express relative position of
+                                    a symbol in its containing section.
+    R_XTENSA_GOTSECBASE      78    Used to express offset of a GOT entry
+                                    that holds base address of a section
+                                    that contains the symbol.
+
+The dynamic loader needs to adjust or "fix up" portions of the data
+segment due to it being dynamically located.  The various dynamic
+relocation entries tell the dynamic loader how to do this.  The text
+segment is dynamically located too, but it is read-only and must not
+have any relocation entries associated with it.
+
+New dynamic relocations have the following types: R_XTENSA_SYM32,
+R_XTENSA_FUNCDESC, R_XTENSA_FUNCDESC_VALUE and R_XTENSA_TLSDESC.
+The precise interpretation given to these relocation types by the
+dynamic linker is described in the following paragraphs.
+
+  R_XTENSA_SYM32
+  --------------
+    References within a module are expressed as R_XTENSA_SYM32 where
+    "r_info" member encodes the relocation type and a section symbol
+    index and "r_addend" encode offset of the target within that
+    section.  The sum of the address of the symbol and of the "r_addend"
+    is stored in the location specified by the "r_offset".
+
+  R_XTENSA_FUNCDESC
+  -----------------
+    The R_XTENSA_FUNCDESC relocation is used to obtain the address of
+    an "official" function descriptor from the dynamic linker.  The
+    "r_offset" field contains the location (offset) of the word
+    which must receive this address.  The "r_info" field contains an
+    encoding of the symbol table index corresponding to the function
+    to resolve.  The dynamic linker resolves the function and
+    determines the address of the corresponding official descriptor,
+    allocating and initializing it as necessary.  (It is the dynamic
+    linker's responsibility to allocate and initialize all official
+    descriptors). The address of the official descriptor is written
+    to the location specified by "r_offset".
+
+    Note: This relocation is always expected to reference symbols for
+    which the dynamic linker is expected to create an "official
+    descriptor".  References to descriptors (for static or hidden
+    functions) which are allocated and initialized by the link editor
+    are handled via pre-existing relocations.
+
+  R_XTENSA_FUNCDESC_VALUE
+  -----------------------
+    The R_XTENSA_FUNCDESC_VALUE relocation is used to initialize
+    both words of a function descriptor.  The "r_offset" member (in
+    an Elf32_Rela struct) specifies the location of the descriptor to
+    initialize.  The "r_info" member encodes both the number
+    associated with the R_XTENSA_FUNCDESC_VALUE type and a symbol table
+    index.
+
+    R_XTENSA_FUNCDESC_VALUE relocations found in the .rela.dyn are
+    used either for non-lazy binding support (forced at compile/link
+    time) or for static function descriptor initializations.  These
+    cases will be considered separately.
+
+    Relocations used for resolving external functions (in a non-lazy
+    manner) have the symbol index encoded in "r_info" set to
+    correspond to symbol to resolve.  The descriptor contents are
+    irrelevant and are ignored.  The function corresponding to the
+    symbol index is resolved and the entry point and GOT address
+    for that function are written to the descriptor.
+
+    The R_XTENSA_FUNCDESC_VALUE relocation is also used to initialize
+    function descriptors used as addresses for static, non-overridable
+    functions.  When used for this purpose, the "r_info" member encodes
+    the symbol table index for the section in which the function is
+    found and the "r_addend" member encodes the relative position of the
+    function entry point in that section.
+
+  R_XTENSA_TLSDESC
+  ----------------
+    The R_XTENSA_TLSDESC relocation marks GOT entry with the following
+    structure:
+
+      struct tlsdesc {
+        void *(*resolver)(struct tlsdesc *);
+        union {
+          void *pointer;
+          unsigned long value;
+        } argument;
+      };
+
+    The contents of the structure is chosen by the dynamic linker
+    depending on how the space for the TLS block containing the symbol
+    referenced by the "r_info" field of the relocation entry is
+    allocated.  The "resolver" function must return the pointer to the
+    symbol plus "r_addend" in the current thread.  The function is
+    supposed to follow the standard function calling convention of the
+    base ABI.
+
+
+Assembler operators
+-------------------
+
+Below is a list of additional operators for writing assembly code.
+
+    Name                Corresponding relocations
+    ----                -------------------------
+
+    @GOT                R_XTENSA_GOT
+    @GOTOFF             R_XTENSA_GOTOFF
+    @GOTFUNCDESC        R_XTENSA_GOTFUNCDESC
+    @GOTOFFFUNCDESC     R_XTENSA_GOTOFFFUNCDESC
+    @FUNCDESC           R_XTENSA_FUNCDESC
+    @GOTTLSDESC         R_XTENSA_GOTTLSDESC
+    @SECREL             R_XTENSA_SECREL
+    @GOTSECBASE         R_XTENSA_GOTSECBASE
+
+
+ELF Header
+----------
+
+The Xtensa processor specific value for the EI_OSABI entry of the
+e_ident field in the ELF header which indicates the use of this ABI is
+ELFOSABI_XTENSA_FDPIC with value 65.  When EI_OSABI e_ident entry of
+the ELF header is set to ELFOSABI_XTENSA_FDPIC it means each segment of
+the binary can be loaded at an arbitrary address, which means sharing
+of text segments is possible.
+
+
+Start up
+--------
+
+At the program's entry point, the stack pointer must be set to an
+address close to the end of the stack segment.  The size of the stack
+segment is specified by the PT_GNU_STACK program header.  Starting at
+the address pointed to by sp, the program should be able to find its
+arguments, environment variables, and auxiliary vector table and load
+maps.  Here's what the stack looks like:
+
+  sp:           argc
+  sp+4:         argv[0]
+  ...
+  sp+4*argc:    argv[argc-1]
+  sp+4+4*argc:  NULL
+  sp+8+4*argc:  envp[0]
+  ...
+                NULL
+
+The NULL terminator of envp is immediately followed by the Auxiliary
+Vector Table.  Each entry is a pair of words, the first being an entry
+type, the second being either an integer value or a pointer.  An entry
+type of value zero (AT_NULL) marks the end of the auxiliary vector.
+
+Load maps go somewhere on the stack.  They use the following data
+structure:
+
+struct elf32_fdpic_loadmap {
+  /* Protocol version number, must be zero.  */
+  Elf32_Half version;
+  /* Number of segments in this map.  */
+  Elf32_Half nsegs;
+  /* The actual memory map.  */
+  struct elf32_fdpic_loadseg segs[/*nsegs*/];
+};
+
+/* This data structure represents a PT_LOAD segment.  */
+struct elf32_fdpic_loadseg
+{
+  /* Core address to which the segment is mapped.  */
+  Elf32_Addr addr;
+  /* VMA recorded in the program header.  */
+  Elf32_Addr p_vaddr;
+  /* Size of this segment in memory.  */
+  Elf32_Word p_memsz;
+};
+
+At program start-up, register a4 should hold a pointer to a struct
+elf32_fdpic_loadmap that describes where the kernel mapped each of the
+PT_LOAD segments of the executable.  At start-up of an interpreter for
+another program (e.g., ld.so), a5 will be set to the load map of the
+interpreter, and a6 will be set to a pointer to the PT_DYNAMIC
+section of the interpreter, if it was mapped as part of any loadable
+segment, or 0 otherwise.  In the absence of an interpreter, a5 will be
+0, and a6 will be the main program's PT_DYNAMIC address.  All other
+registers have indeterminate values.
+
+Both static and dynamic executables are responsible for
+self-relocating and initializing the FDPIC register.  Self-relocation
+is accomplished by adjusting, according to the link map stored in a4,
+every pointer in the range [__ROFIXUP_LIST__,__ROFIXUP_END__-4).  The
+addresses of __ROFIXUP_LIST__ and __ROFIXUP_END__ can be computed by
+means of PC-relative addressing, since they are known to be in the
+text segment.
+
+The pointers in the .rofixup section are created by the linker; FDPIC
+object files should not contain .rofixup sections.  The linker emits
+rofixup entries in static or dynamic executables that are not linked
+with -pie wherever it would emit a dynamic relocation in PIEs or
+dynamic libraries.
+
+The linker also emits, as the last entry of the .rofixup section, the
+value of the _GLOBAL_OFFSET_TABLE_ symbol.  The code that performs
+self-relocation should not dereference this last entry to relocate its
+contents; instead, it should simply compute the relocated value of the
+entry itself, thus obtaining the FDPIC register value without using any
+non-PIC or inter-segment relocation, that would force the executable
+to relocate as a unit.
+
+In case a dynamic loader is used, it may set a5 to the address of a
+function descriptor that represents a function to be called at program
+termination time.  The dynamic loader, however, must not depend on
+this function being called for proper termination.
+
+Chunks of code inserted in .init and .fini sections (_init and _fini
+functions, respectively) must not assume a11 to hold the value of the
+FDPIC register.  _init and _fini prologues are expected to save the
+initial a11 value in a12.
+
+
+Debugger Support - Overview
+---------------------------
+
+Debugger support is substantially different from what is normally done
+on GNU/Linux for the following reasons:
+
+    1) The usual method for finding the dynamic linker data structures
+       won't work since the text and data area for the main program
+       itself are dynamically located.  Normally, the debugger is able
+       to find the address of the executable's sections by looking in
+       the executable itself.  This, in turn allows the debugger to
+       find the dynamic section in which it looks for the value of the
+       DT_DEBUG tag.  The DT_DEBUG value provides the debugger with
+       the address of the r_debug struct which, in turn, provides
+       access to the necessary relocation information for shared
+       objects.  But, since none of this will work, an alternate
+       method must be found for locating the dynamic linker data
+       structures.
+
+    2) The debugger must relocate different sections by different
+       amounts due to the fact that the text and data areas (and
+       perhaps other sections too) are relocated independently.
+       The dynamic linker's debug interface must allow the debugger
+       to find out how much each section has been relocated by.
+
+    3) It must be possible for the debugger to attach to a process at
+       an arbitrary point of its execution.
+
+    4) Text areas are truly shared among processes which means there
+       must be some sort of kernel level support for breakpoints.
+
+Debugger Support - Locating the Dynamic Linker's Data Structures
+----------------------------------------------------------------
+
+In a given process, for all possible values of FDPIC (which is in a11
+at function entry time), the word at FDPIC+8 - which is in the dynamic
+linker reserve area - contains a pointer to the dynamic linker's data
+structures.  This means that each data area for a shared library or
+the main executable in a given process contains a pointer to dynamic
+linker data structures describing the various load objects and their
+relocations.
+
+Unfortunately, a11 may not keep its value throughout the execution of
+a function.  It may be overwritten and used for any other computation.
+If it's needed again, it can be copied to another register or to a
+stack slot.  It might be possible for the debugger to locate the FDPIC
+value at such alternate locations by using call-frame debug
+information, but to do so, it would need the PC value as in the
+executable, not the relocated PC value in the memory location the
+kernel chose to map the text segment of the executable, or of any of
+the shared libraries it may have been linked with.
+
+To enable a debugger to find where an executable is located in memory,
+the initial load maps that the kernel passes to the program in a4
+and a5 are made available with ptrace calls, as described below:
+
+#define PTRACE_GETFDPIC  22 /* get the ELF fdpic loadmap address */
+
+#define PTRACE_GETFDPIC_EXEC ((void*)0) /* [addr] request the executable loadmap */
+#define PTRACE_GETFDPIC_INTERP ((void*)1) /* [addr] request the interpreter loadmap */
+
+struct elf32_fdpic_loadmap *x;
+ptrace (PTRACE_GETFDPIC, pid, PTRACE_GETFDPIC_EXEC /* or _INTERP */, &x);
+
+With these maps plus the executable (and/or interpreter) symbol table,
+the debugger can locate the program's GOT in memory, and thus obtain
+the link_map doubly-linked list (see below), from which it can obtain
+the loadmaps of all loaded modules.
+
+Obtaining r_debug requires the dynamic loader's link map and symbol
+tables only, to locate the _dl_debug_addr symbol defined in the
+dynamic loader.  If there is no dynamic loader, or if it hasn't got to
+the point at which it sets up the main program's GOT reserve area,
+r_debug won't be available.
+
+
+Debugger Support - Data structures
+----------------------------------
+
+The word at FDPIC+8 is a pointer to a struct of the following form:
+
+  struct link_map {
+    /* These first few members are part of the protocol with the debugger.
+       This is the same format used in SVR4.  */
+
+    struct elf32_fdpic_loadaddr l_addr;
+    char *l_name;               /* Absolute file name object was found in.  */
+    ElfW(Dyn) *l_ld;            /* Dynamic section of the shared object.  */
+    struct link_map *l_next, *l_prev; /* Chain of loaded objects.  */
+  };
+
+Where l_addr's type definition is:
+
+  struct elf32_fdpic_loadaddr {
+    struct elf32_fdpic_loadmap *map;
+    void *got_value;
+  };
+
+(struct elf32_fdpic_loadaddr is the type of field dlpi_addr in struct
+ dl_phdr_info as well)
+
+_dl_debug_addr (a global symbol defined in the dynamic loader) is a
+pointer to the following type:
+
+  struct r_debug {
+    int r_version;              /* Version number for this protocol.  */
+
+    struct link_map *r_map;     /* Head of the chain of loaded objects.  */
+
+    /* This is the address of a function internal to the run-time linker,
+       that will always be called when the linker begins to map in a
+       library or unmap it, and again when the mapping change is complete.
+       The debugger can set a breakpoint at this address if it wants to
+       notice shared object mapping changes.  Being a pointer to a
+       function, it is actually a pointer to a function descriptor.  */
+    ElfW(Addr) r_brk;
+    enum
+      {
+        /* This state value describes the mapping change taking place when
+           the "r_brk" address is called.  */
+        RT_CONSISTENT,          /* Mapping change is complete.  */
+        RT_ADD,                 /* Beginning to add a new object.  */
+        RT_DELETE               /* Beginning to remove an object mapping.  */
+      } r_state;
+
+    ElfW(Addr) r_ldbase;        /* GOT pointer of the dynamic loader.  */
+  };
+
+The version number for this protocol will be 1.
+
+
+Debugger Support - Finding GOT Addresses
+----------------------------------------
+
+The field "got_value" in the link_map struct provides the debugger
+with the GOT address for all functions in the load module described by
+that link_map entry.
+
+
+Debugger Support - Breakpoint Considerations
+--------------------------------------------
+
+Debugger applications implement software breakpoints by causing a trap
+instruction to be written at the address at which a breakpoint is
+desired.  (The debugger will first fetch the contents of the location
+under consideration so that it may be restored when the breakpoint is
+removed).
+
+In order to implement software breakpoints, the text sections for the
+process being debugged must reside in writable memory.  It is okay for
+the text section of non-debugged processes to reside in read-only
+memory, but some provision must be made to run a process being
+debugged in read/write memory.  Furthermore, this determination must
+be made at the time the process is started.  (Trying to migrate a
+running process from read-only to read/write memory would involve
+attempting to fix text section pointers on the stack and heap.)
+
+When a process that is being ptrace()d runs exec()s, the kernel must
+not share the text segment of the newly-exec()ed program, nor those of
+an interpreter it might require.  Also, the mmap() system call must
+not share text segments used by libraries of such a process, which it
+would normally do in response to the presence of MAP_EXECUTABLE and
+MAP_DENYWRITE in the flags passed to mmap().
+
+This arrangement will not make processes that the debugger attaches to
+after they are mapped in look like they have independent sets of
+breakpoints; they may just crash instead, if they reach a breakpoint
+instruction set with ptrace for another process.  The ABI does not
+specify any support for this case; if required, kernel interfaces to
+insert or remove a breakpoint at a specified address could be added.
+The kernel would have responsibility to remove and replace them at
+context switches, and would refuse to insert breakpoints for code
+running execute-in-place (XIP) from ROM.
+
+
+Provisioning for Native Posix Thread Library
+--------------------------------------------
+
+The Native Posix Thread Library (NPTL) requires a register to be used
+as the thread context pointer.  User register THREADPTR is reserved
+for this purpose, as on GNU/Linux.
+
+
+Revision History
+----------------
+
+Version 1 (8 April 2024):
+
+- Initial draft for public comment.
+
+
+References
+----------
+
+[1] "IA-64 Software Conventions and Runtime Architecture Guide", Intel, 2000,
+    pp. 8-1 thru 8-4.
+
+[2] "Unix System V Application Binary Interface" (for IA-64), Intel, 2000,
+    pp. 5-4 thru 5-9.
+
+[3] FR-V FDPIC ABI
+<http://www.lsd.ic.unicamp.br/~oliva/writeups/FR-V/>.
+
+[4] Blackfin FDPIC ABI
+<http://docs.blackfin.uclinux.org/doku.php?id=application_binary_interface>.
+
+[5] SH FDPIC ABI
+<https://j-core.org/downloads/fdpic-sh.txt>.
+
+[6] ELF Handling For Thread-Local Storage
+<https://www.akkadia.org/drepper/tls.pdf>
+
+Copyright 2008, 2010 CodeSourcery, Inc.  Based on FR-V FDPIC ABI Version 1.0a,
+Copyright 2004 Red Hat, Inc.  This specification is licensed under the
+Open Publication License, version 1.0 with the further limitation that
+distribution of substantively modified versions of this specification is
+prohibited without the explicit permission of the copyright holder.
+Adaptation of the specification to a specific processor is not
+considered a substantive modification, and the copyright holder grants
+express permission for such adaptations.  Such adaptations should be
+attributed as this specification as adapted for the specific processor.
+Further, the copyright holder grants permission to  copy and modify text
+from this specification into a new specification so long as the new
+specification is not identified as being related to or a modification of
+this specification or in any way endorsed by the copyright holder.
